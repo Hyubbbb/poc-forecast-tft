@@ -1,0 +1,16 @@
+torch>=2.2
+pytorch-lightning>=2.2
+pytorch-forecasting>=1.0
+pandas>=2.0
+polars>=1.0
+numpy
+matplotlib
+seaborn
+mlflow>=3.10
+lightgbm>=4.0
+snowflake-connector-python
+pyarrow
+scikit-learn
+optuna
+jupyter
+ipykernel

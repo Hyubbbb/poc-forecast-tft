@@ -1,0 +1,83 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# --- Virtualenv / Env ---
+.venv/
+venv/
+.env
+.env.local
+.env.*.local
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Test / Lint cache ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- ML experiment / logging ---
+mlruns/
+lightning_logs/
+wandb/
+tb_logs/
+tensorboard/
+outputs/
+checkpoints/
+
+# --- Model / Checkpoint artifacts ---
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.joblib
+*.h5
+*.hdf5
+*.onnx
+
+# --- Data files ---
+data/
+*.parquet
+*.csv
+*.feather
+*.arrow
+*.npy
+*.npz
+*.xlsx
+
+# --- Optuna / DB ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Snowflake credentials ---
+connections.toml
+config.toml
+.snowflake/
+
+# --- Logs ---
+*.log
+logs/
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Claude Code / OMC ---
+.omc/
+.claude/
+!.claude/settings.json
