@@ -1,0 +1,97 @@
+# Supplies CP6677 — encoder=52, decoder=26.
+# 입력 parquet은 scripts/preprocess_supplies_cp.build_model_ready_from_cp_csv() 산출물.
+# - leakage 컬럼(채널 4종 + SALE_AMT) 제거 완료
+# - BRAND_CD/PRDT_KIND_CD 단일값 → 제거 완료
+# - series_id = STYLE_CD + '_' + COLOR_CD_NORM 신설
+# - 음수 타깃 → 0 clip 완료
+# - history < 78w (encoder+decoder) 시리즈 제거 완료
+
+data:
+  parquet_path: data/sc_weekly_cp6677_model_ready.parquet
+  group_key: series_id
+  target: WEEKLY_SALE_QTY
+  actual_end_zero_ratio_threshold: 0.999
+
+split:
+  # 학습 ≤ 2025-06 / 평가 horizon = 2025-07-07 ~ 2025-12-29 (정확히 26주, decoder_len 매칭)
+  train_decoder_end: '2025-06-30'
+  val_cutoff: '2025-12-29'
+
+dataset:
+  encoder_len: 52
+  min_encoder_len: 4
+  decoder_len: 26
+  in_season_filter: false
+  # SC sparse target 에 대해 GroupNormalizer(series × log1p)가 EncoderNormalizer 평균회귀 경향을 완화.
+  target_normalizer: group_log1p
+
+  static_categoricals:
+    - series_id
+    - STYLE_CD
+    - TEAM_CD
+    - COLOR_BASE_CD
+
+  static_reals: []
+
+  # WEEK_OF_YEAR/SIN/COS/WEEKS_SINCE_FIRST_SALE 는 scripts/train.py:prepare_features 가 자동 생성.
+  # MONTH/QUARTER 도 prepare_features 가 자동 생성 (시즌성 보조 신호).
+  time_varying_known_reals:
+    - WEEK_OF_YEAR
+    - WEEK_SIN
+    - WEEK_COS
+    - WEEKS_SINCE_FIRST_SALE
+    - MONTH
+    - QUARTER
+    - FCST_AVG_MIN_TEMP
+    - FCST_AVG_MAX_TEMP
+    - FCST_TOTAL_PCP
+    - FCST_MIN_MIN_TEMP
+    - FCST_MAX_MAX_TEMP
+    - FCST_TEMP_RANGE
+
+  # WEEKLY_DISC_RAT 는 미래 실측 불가능 → known→unknown 으로 이동 (leakage 위험 차단).
+  # 재고 변수(BOW_STOCK/STOCK_RATIO/CUM_INTAKE)는 담당자 정의 확인 전까지 잠정 제외.
+  # BOW_STOCK<0 38행 발견(반품 누적 > stock) — ablation으로 재투입 예정.
+  time_varying_unknown_reals:
+    - WEEKLY_DISC_RAT
+
+  # DISC_RAT 가 unknown 으로 이동했으므로 forward-fill 대상 없음.
+  forward_fill_reals: []
+
+model:
+  hidden_size: 64
+  attention_head_size: 4
+  hidden_continuous_size: 32
+  dropout: 0.1
+  learning_rate: 0.03
+  # IQR(50% CI) + median: sparse target 학습 안정성 + 비즈니스 보수/중앙/관대 3시나리오.
+  # 안전재고용 tail 분위 필요 시 [0.05, 0.25, 0.5, 0.75, 0.95]로 확장.
+  quantiles: [0.25, 0.5, 0.75]
+  reduce_on_plateau_patience: 4
+
+trainer:
+  max_epochs: 30
+  batch_size: 64
+  num_workers: 0
+  gradient_clip_val: 0.1
+  early_stopping_patience: 5
+  accelerator: auto
+  log_interval: 10
+
+mlflow:
+  tracking_uri: http://10.90.8.125:5000/
+  experiment: SC_Total_TFT
+  source_tag: supplies_cp_e52_d26_h2_2025_noStock_iqr
+
+artifacts:
+  out_dir: artifacts/tft_supplies_cp_e52_d26
+  forecast_filename: forecast_2025.parquet
+
+dry_run:
+  max_epochs: 1
+  batch_size: 32
+  data_path: tests/fixtures/sc_weekly_tiny.parquet
+  out_dir: artifacts/dry_run_supplies_cp_e52_d26
+  encoder_len: 8
+  decoder_len: 4
+  min_encoder_len: 2
