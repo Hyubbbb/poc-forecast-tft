@@ -31,6 +31,7 @@ tb_logs/
 tensorboard/
 outputs/
 checkpoints/
+artifacts/
 
 # --- Model / Checkpoint artifacts ---
 *.ckpt
