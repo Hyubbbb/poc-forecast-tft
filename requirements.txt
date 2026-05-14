@@ -14,3 +14,14 @@ scikit-learn
 optuna
 jupyter
 ipykernel
+tabulate
+
+# Phase 1 — TDD + jupytext
+pytest>=8.0
+pytest-mock>=3.12
+pandera>=0.20
+jupytext>=1.16
+pyyaml>=6.0
+
+# Stage 0 — MLflow 트래킹 + 시각화 강화 (spec: mlflow-experiment-tracking v0.2.0)
+plotly>=5.18

@@ -3,8 +3,8 @@
 # spec 생성/status 변경 시 함께 업데이트할 것
 
 specs:
-  - module: train-sc-tft-multistep
-    title: "SC-Total TFT 다중 호라이즌(t+1~t+8) 예측 PoC"
+  - module: mlflow-experiment-tracking
+    title: "MLflow 실험 트래킹 + 시각화 강화 인프라 (Stage 0) — nested run + 4계층 metric + interpretability/overlay 자동"
     kind: module
     status: draft
-    version: "0.1.0"
+    version: "0.2.0"

@@ -206,11 +206,82 @@ def build_datasets(df: pd.DataFrame, cfg: dict):
     return training, validation, test
 
 
+def _build_monitoring_callbacks():
+    """MLflow 학습 모니터링용 콜백 — lr / epoch_time_sec / grad_norm_l2 / val_mae_norm.
+
+    val_mae_norm 은 정규화 공간 trend 보조 지표. 정확한 horizon×WAPE 는 학습 종료 후
+    _enrich_mlflow_run() 이 wape_h{N} metric + wape_by_horizon.json 으로 적재한다.
+    """
+    import time
+
+    import lightning.pytorch as pl
+    import torch
+    from lightning.pytorch.callbacks import LearningRateMonitor
+
+    class EpochTimer(pl.Callback):
+        def on_train_epoch_start(self, trainer, pl_module):
+            self._t0 = time.perf_counter()
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            pl_module.log(
+                "epoch_time_sec", time.perf_counter() - self._t0,
+                on_epoch=True, on_step=False, prog_bar=False,
+            )
+
+    class GradNormLogger(pl.Callback):
+        def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+            sq = 0.0
+            for p in pl_module.parameters():
+                if p.grad is not None:
+                    sq += float(p.grad.detach().data.norm(2).item()) ** 2
+            pl_module.log(
+                "grad_norm_l2", sq ** 0.5,
+                on_step=True, on_epoch=False, prog_bar=False,
+            )
+
+    class ValMetricLogger(pl.Callback):
+        def __init__(self):
+            self._abs_err_sum = 0.0
+            self._n = 0
+
+        def on_validation_epoch_start(self, trainer, pl_module):
+            self._abs_err_sum = 0.0
+            self._n = 0
+
+        def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+            x, y = batch
+            with torch.no_grad():
+                out = pl_module(x)
+            pred = out["prediction"] if isinstance(out, dict) else getattr(out, "prediction", None)
+            if pred is None:
+                return
+            q = list(getattr(pl_module.loss, "quantiles", []))
+            p50_idx = q.index(0.5) if 0.5 in q else len(q) // 2
+            p = pred[..., p50_idx]
+            t = y[0] if isinstance(y, (tuple, list)) else y
+            self._abs_err_sum += float((p - t).abs().sum().item())
+            self._n += int(t.numel())
+
+        def on_validation_epoch_end(self, trainer, pl_module):
+            if self._n > 0:
+                pl_module.log(
+                    "val_mae_norm", self._abs_err_sum / self._n,
+                    on_epoch=True, prog_bar=False,
+                )
+
+    return [
+        LearningRateMonitor(logging_interval="epoch"),
+        EpochTimer(),
+        GradNormLogger(),
+        ValMetricLogger(),
+    ]
+
+
 def train_tft(cfg: dict, run_name: str | None = None) -> dict:
     """TFT 학습. notebook에서 import 가능. dict(best_path, training, model, config) 반환."""
     import lightning.pytorch as pl
     import mlflow
-    from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+    from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
     from lightning.pytorch.loggers import MLFlowLogger
     from pytorch_forecasting import TemporalFusionTransformer
     from pytorch_forecasting.metrics import QuantileLoss
@@ -277,6 +348,7 @@ def train_tft(cfg: dict, run_name: str | None = None) -> dict:
                 mode="min",
                 filename="tft-{epoch:02d}-{val_loss:.4f}",
             ),
+            *_build_monitoring_callbacks(),
         ],
         enable_progress_bar=True,
     )
@@ -310,14 +382,41 @@ def _enrich_mlflow_run(
     training,
     df,
     out_dir: Path,
+    *,
+    parent_run_id: str | None = None,
 ) -> None:
-    """학습 직후 MLflow run에 cfg flat params + ckpt/pkl/yaml artifact + 자동 평가 적재."""
+    """학습 직후 MLflow run 보강. spec: mlflow-experiment-tracking v0.2.0.
+
+    적재 내용 (모두 자동):
+    - tags: make_run_tags 표준 8개 (source, experiment_intent, data_scope,
+            backtest_fold, git_sha, model_architecture, random_seed, is_baseline)
+    - params: cfg.* (flatten_cfg) + dataset audit (style_list/sha256/sanity) + env
+    - metrics: 4계층 (overall + horizon + bin + STYLE×bin) + baseline lift
+    - artifacts: config.yaml, training_dataset.pkl, forecast.parquet,
+                 viz/{interpretability, overlay}, sanity/dataset_audit.json,
+                 best_ckpt_path.txt (ckpt 자체는 용량 사유 직접 업로드 X)
+
+    parent_run_id 제공 시 MLflow native nested run 으로 연결 (mlflow.parentRunId tag 자동 부착).
+    """
+    import json
     import mlflow
-    from scripts.forecast_utils import (
-        evaluate_horizons,
-        flatten_cfg,
-        log_eval_to_mlflow,
-        plot_horizon_wape,
+    import pandas as pd
+
+    from scripts.eval_utils import (
+        compute_full_metrics,
+        make_naive_cohort_mean,
+        make_seasonal_naive,
+        wape,
+    )
+    from scripts.forecast_utils import flatten_cfg, predict_dataframe
+    from scripts.mlflow_logging import (
+        compute_dataset_audit,
+        infer_model_architecture,
+        log_full_metrics,
+        log_params_safe,
+        make_run_tags,
+        set_run_tags,
+        system_env_params,
     )
 
     tracking_uri = mlflow_cfg.get("tracking_uri")
@@ -326,34 +425,186 @@ def _enrich_mlflow_run(
         return
 
     mlflow.set_tracking_uri(tracking_uri)
-    with mlflow.start_run(run_id=run_id):
+
+    # parent_run_id → MLflow native parentRunId tag (UI 트리 구조)
+    if parent_run_id:
         try:
-            mlflow.log_params(flatten_cfg(cfg, prefix="cfg"))
-        except Exception as e:  # 기등록 키 충돌 등은 silent
-            print(f"⚠️  mlflow.log_params skipped: {e}")
-        for fname in ("best.ckpt", "training_dataset.pkl", "config.yaml"):
+            set_run_tags(run_id, {"mlflow.parentRunId": parent_run_id}, tracking_uri=tracking_uri)
+        except Exception as e:
+            print(f"⚠️  parent_run_id tag skipped: {e}")
+
+    # ── 1. Tags — 표준 8개 ──
+    try:
+        intent = mlflow_cfg.get("experiment_intent", "unspecified")
+        data_scope = mlflow_cfg.get("data_scope") or Path(cfg["data"]["parquet_path"]).stem
+        fold = mlflow_cfg.get("backtest_fold", "single")
+        seed = cfg.get("train", {}).get("seed")
+        is_baseline = bool(mlflow_cfg.get("is_baseline", False))
+        arch = infer_model_architecture(cfg)
+        tags = make_run_tags(
+            experiment_intent=intent,
+            data_scope=data_scope,
+            backtest_fold=fold,
+            model_architecture=arch,
+            random_seed=seed,
+            is_baseline=is_baseline,
+            source=mlflow_cfg.get("source_tag"),
+        )
+        set_run_tags(run_id, tags, tracking_uri=tracking_uri)
+    except Exception as e:
+        print(f"⚠️  set_run_tags skipped: {e}")
+
+    # ── 2. Params — cfg + dataset audit + env ──
+    train_end = pd.Timestamp(cfg["split"]["train_decoder_end"])
+    val_end = pd.Timestamp(cfg["split"]["val_cutoff"])
+    decoder_len = cfg["dataset"]["decoder_len"]
+    group_key = cfg["data"]["group_key"]
+    target = cfg["data"]["target"]
+    parquet_path = cfg["data"]["parquet_path"]
+
+    try:
+        log_params_safe(run_id, flatten_cfg(cfg, prefix="cfg"), tracking_uri=tracking_uri)
+    except Exception as e:
+        print(f"⚠️  flatten_cfg log_params skipped: {e}")
+
+    sanity_dir = out_dir / "sanity"
+    sanity_dir.mkdir(exist_ok=True)
+    try:
+        audit = compute_dataset_audit(
+            df, parquet_path=parquet_path, cutoff=train_end, val_end=val_end,
+            group_key=group_key, style_col="STYLE_CD", target=target,
+        )
+        log_params_safe(run_id, audit, tracking_uri=tracking_uri)
+        (sanity_dir / "dataset_audit.json").write_text(json.dumps(audit, indent=2, ensure_ascii=False))
+    except Exception as e:
+        print(f"⚠️  dataset_audit skipped: {e}")
+
+    try:
+        log_params_safe(run_id, system_env_params(), tracking_uri=tracking_uri)
+    except Exception as e:
+        print(f"⚠️  env params skipped: {e}")
+
+    # ── 3. best_ckpt_path.txt (ckpt 직접 업로드 X) ──
+    ckpt_path = out_dir / "best.ckpt"
+    if ckpt_path.exists():
+        (out_dir / "best_ckpt_path.txt").write_text(str(ckpt_path.resolve()))
+
+    # ── 4. 4계층 auto eval (validation 윈도우: train_end ~ val_end) ──
+    forecast = None
+    try:
+        forecast = predict_dataframe(
+            model, training, df, train_end,
+            decoder_len=decoder_len, group_key=group_key,
+        )
+        df_ts = df.copy()
+        df_ts["WEEK_START"] = pd.to_datetime(df_ts["WEEK_START"])
+        val_window = df_ts[
+            (df_ts["WEEK_START"] > train_end)
+            & (df_ts["WEEK_START"] <= train_end + pd.Timedelta(weeks=decoder_len))
+        ]
+        actual_df = val_window[[group_key, "WEEK_START", target]].rename(
+            columns={"WEEK_START": "forecast_week", target: "actual"}
+        )
+
+        style_map = None
+        if "STYLE_CD" in df_ts.columns:
+            style_map = df_ts.drop_duplicates(group_key).set_index(group_key)["STYLE_CD"]
+
+        # baseline WAPE — overall 단위
+        baseline_wapes: dict = {}
+        try:
+            ncm = make_naive_cohort_mean(df_ts, group_key=group_key, target=target)
+            sn = make_seasonal_naive(df_ts, group_key=group_key, target=target)
+            actuals, ncm_preds, sn_preds = [], [], []
+            for _, row in actual_df.iterrows():
+                sc = row[group_key]
+                h = int((row["forecast_week"] - train_end).days // 7)
+                actuals.append(row["actual"])
+                ncm_preds.append(ncm(df_ts, sc, train_end, h))
+                sn_preds.append(sn(df_ts, sc, train_end, h))
+            actuals_s = pd.Series(actuals)
+            for name, preds in [("naive_cohort_mean", pd.Series(ncm_preds)),
+                                ("seasonal_naive", pd.Series(sn_preds))]:
+                m = preds.notna()
+                if m.any():
+                    baseline_wapes[name] = wape(actuals_s[m].values, preds[m].values)
+        except Exception as e:
+            print(f"⚠️  baseline wape skipped: {e}")
+
+        metrics = compute_full_metrics(
+            forecast, actual_df, model, group_key=group_key,
+            style_map=style_map, baseline_wapes=baseline_wapes or None,
+        )
+        n = log_full_metrics(run_id, metrics, tracking_uri=tracking_uri)
+        print(f"  logged {n}/{len(metrics)} metrics (4계층)")
+
+        # forecast.parquet
+        forecast_path = out_dir / "forecast.parquet"
+        forecast.to_parquet(forecast_path, index=False)
+
+    except Exception as e:
+        print(f"⚠️  4계층 auto eval skipped: {e}")
+        actual_df = None
+        style_map = None
+
+    # ── 5. Visualization (interpretability + overlay) ──
+    viz_dir = out_dir / "viz"
+    if forecast is not None and actual_df is not None:
+        try:
+            from scripts.visualize import (
+                make_all_sc_overlay_pdf,
+                make_attention_plots,
+                make_interactive_dashboard,
+                make_vsn_plots,
+            )
+            interp_dir = viz_dir / "interpretability"
+            overlay_dir = viz_dir / "overlay"
+            batch_size = cfg["trainer"].get("batch_size", 128)
+            try:
+                make_vsn_plots(model, training, df, train_end,
+                               decoder_len=decoder_len, out_dir=interp_dir, batch_size=batch_size)
+            except Exception as e:
+                print(f"⚠️  vsn plots skipped: {e}")
+            try:
+                make_attention_plots(model, training, df, train_end,
+                                     decoder_len=decoder_len, group_key=group_key, target=target,
+                                     out_dir=interp_dir, top_n_sc=3, batch_size=batch_size)
+            except Exception as e:
+                print(f"⚠️  attention plots skipped: {e}")
+            try:
+                df_ts = df.copy()
+                df_ts["WEEK_START"] = pd.to_datetime(df_ts["WEEK_START"])
+                make_all_sc_overlay_pdf(
+                    forecast, actual_df, group_key=group_key,
+                    out_pdf=overlay_dir / "all_sc_overlay.pdf",
+                    style_map=style_map, history_df=df_ts, history_target=target,
+                )
+                make_interactive_dashboard(
+                    forecast, actual_df, group_key=group_key,
+                    out_html=overlay_dir / "interactive_dashboard.html",
+                    style_map=style_map, history_df=df_ts, history_target=target,
+                )
+            except Exception as e:
+                print(f"⚠️  overlay viz skipped: {e}")
+        except Exception as e:
+            print(f"⚠️  visualize module skipped: {e}")
+
+    # ── 6. Artifacts — config + training_dataset + best_ckpt_path + sanity/ + viz/ + forecast ──
+    with mlflow.start_run(run_id=run_id):
+        for fname in ("training_dataset.pkl", "config.yaml", "best_ckpt_path.txt", "forecast.parquet"):
             fpath = out_dir / fname
             if fpath.exists():
                 try:
                     mlflow.log_artifact(str(fpath))
                 except Exception as e:
-                    print(f"⚠️  mlflow.log_artifact({fname}) skipped: {e}")
-
-    # 자동 평가 — val cutoff 기준 horizon × WAPE 산출.
-    try:
-        val_cutoff = cfg["split"]["val_cutoff"]
-        decoder_len = cfg["dataset"]["decoder_len"]
-        eval_df = evaluate_horizons(df, model, training, val_cutoff, decoder_len=decoder_len, brand_slice=False)
-        if not eval_df.empty:
-            json_path = out_dir / "wape_by_horizon.json"
-            plot_path = out_dir / "wape_by_horizon.png"
-            fig = plot_horizon_wape(eval_df)
-            fig.savefig(plot_path)
-            import matplotlib.pyplot as plt
-            plt.close(fig)
-            log_eval_to_mlflow(run_id, eval_df, plot_path, tracking_uri=tracking_uri, json_path=json_path)
-    except Exception as e:
-        print(f"⚠️  auto eval skipped: {e}")
+                    print(f"⚠️  log_artifact({fname}) skipped: {e}")
+        for sub in ("sanity", "viz"):
+            sub_dir = out_dir / sub
+            if sub_dir.exists() and any(sub_dir.iterdir()):
+                try:
+                    mlflow.log_artifacts(str(sub_dir), artifact_path=sub)
+                except Exception as e:
+                    print(f"⚠️  log_artifacts({sub}) skipped: {e}")
 
 
 def save_artifacts(best_path: str, model, training, out_dir: Path, cfg: dict | None = None) -> None:
