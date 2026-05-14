@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poc-forecast-tft"
+version = "0.1.0"
+description = "SC-Total TFT multi-horizon forecasting PoC"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-q",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "e2e: end-to-end smoke tests (require tiny fixture)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:pytorch_lightning",
+    "ignore::DeprecationWarning:torch",
+    "ignore::FutureWarning:pytorch_forecasting",
+]
+
+[tool.jupytext]
+formats = "ipynb,py:percent"
+notebook_metadata_filter = "-jupytext.text_representation.jupytext_version,-jupytext.text_representation.format_version"
