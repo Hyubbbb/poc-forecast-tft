@@ -52,6 +52,9 @@ data/
 *.npz
 *.xlsx
 
+# Phase 1: tiny fixture는 git에 포함 (≤300KB, 익명화됨)
+!tests/fixtures/*.parquet
+
 # --- Optuna / DB ---
 *.db
 *.sqlite
@@ -81,3 +84,5 @@ desktop.ini
 .omc/
 .claude/
 !.claude/settings.json
+
+참고자료/
